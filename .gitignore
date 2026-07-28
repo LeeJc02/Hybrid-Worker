@@ -1,7 +1,39 @@
-dist/
+# Dependencies
 node_modules/
-.DS_Store
+
+# Generated build and test output
+dist/
+build/
 coverage/
 .vitest/
-*.log
+*.tsbuildinfo
+*.tgz
+
+# Hybrid Worker runtime artifacts
+worker_artifacts/
+worker_summary.json
+reviewer_decision.json
+events.ndjson
+report.json
+*.usage.json
+*.result.txt
+*.diffstat
+
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Caches and temporary files
+.cache/
 tmp/
+*.log
+*.tmp
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
