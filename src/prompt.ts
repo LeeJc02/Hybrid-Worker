@@ -25,6 +25,7 @@ export function implementerPrompt(input: {
   allowedPaths: string[];
   worktree: string;
   baseRepo: string;
+  independentReview?: boolean;
 }): string {
   const allowed = input.allowedPaths.length
     ? input.allowedPaths.map((path) => `- ${path}`).join("\n")
@@ -32,6 +33,22 @@ export function implementerPrompt(input: {
   const testLines = input.tests.length
     ? input.tests.map((test) => `- ${test}`).join("\n")
     : "- No worker tests configured; still run any focused test required by the ticket when practical.";
+  const closeout = input.independentReview
+    ? `Write strict JSON to \`$CPW_SUMMARY_FILE\`:
+{"worker":"${input.worker.name}","summary":"...","changed_files":["..."],"docs_written":["..."],"tests_run":["..."],"tests_passed":true,"risks":[],"needs_codex_attention":false}
+
+Do not write or self-sign a reviewer decision. The harness will run independent verification.
+
+Validate closeout:
+\`$PYTHON -m json.tool "$CPW_SUMMARY_FILE" >/dev/null && test -s "$CPW_SUMMARY_FILE"\``
+    : `Write strict JSON to \`$CPW_SUMMARY_FILE\`:
+{"worker":"${input.worker.name}","summary":"...","changed_files":["..."],"docs_written":["..."],"tests_run":["..."],"tests_passed":true,"risks":[],"needs_codex_attention":false}
+
+Write strict JSON to \`$CPW_DECISION_FILE\`:
+{"worker":"${input.worker.name}","decision":"PASS","issues_found":[],"fixes_applied":[],"tests_run":["..."],"tests_passed":true,"merge_risk":"low"}
+
+Validate closeout:
+\`$PYTHON -m json.tool "$CPW_SUMMARY_FILE" >/dev/null && $PYTHON -m json.tool "$CPW_DECISION_FILE" >/dev/null && test -s "$CPW_SUMMARY_FILE" && test -s "$CPW_DECISION_FILE"\``;
   return `You are Claude worker \`${input.worker.name}\` in a Codex-supervised hybrid run.
 
 Read these files before editing:
@@ -58,15 +75,25 @@ ${testLines}
 - If \`git status --short\` shows any changed path outside allowed paths, restore that path before closeout instead of reporting PASS.
 - Inspect \`git status --short\`, \`git diff --stat\`, and \`git diff --name-only\`; every changed path must be intentional and allowed.
 
-Write strict JSON to \`$CPW_SUMMARY_FILE\`:
-{"worker":"${input.worker.name}","summary":"...","changed_files":["..."],"docs_written":["..."],"tests_run":["..."],"tests_passed":true,"risks":[],"needs_codex_attention":false}
-
-Write strict JSON to \`$CPW_DECISION_FILE\`:
-{"worker":"${input.worker.name}","decision":"PASS","issues_found":[],"fixes_applied":[],"tests_run":["..."],"tests_passed":true,"merge_risk":"low"}
-
-Validate closeout:
-\`$PYTHON -m json.tool "$CPW_SUMMARY_FILE" >/dev/null && $PYTHON -m json.tool "$CPW_DECISION_FILE" >/dev/null && test -s "$CPW_SUMMARY_FILE" && test -s "$CPW_DECISION_FILE"\`
+${closeout}
 
 After closeout passes, output exactly \`${PASS_MARKER}\` and stop. If any required check fails, output \`SELF_EVALUATION: FAIL\` with one short reason and stop.
 `;
+}
+
+export function verifierPrompt(input: { worker: string; worktree: string; diffFile: string; testLogFile: string; decisionFile: string }): string {
+  return `You are an independent read-only verifier for worker ${input.worker}.
+
+Inspect the repository only at ${input.worktree}, the diff at ${input.diffFile}, and test log at ${input.testLogFile}.
+Do not edit repository files, run setup commands, or invent new shell commands.
+Check correctness, scope, tests, regressions, and risk. Write strict JSON to ${input.decisionFile}:
+{"worker":"${input.worker}","decision":"PASS or FAIL","issues_found":[],"fixes_applied":[],"tests_run":[],"tests_passed":true,"merge_risk":"low"}
+Output SELF_EVALUATION: PASS only when the decision is PASS; otherwise output SELF_EVALUATION: FAIL.`;
+}
+
+export function repairPrompt(input: { worker: string; worktree: string; issues: string[] }): string {
+  return `You are the single allowed deep repair agent for worker ${input.worker}.
+Work only in ${input.worktree}. Fix only these verified issues:
+${input.issues.map((issue) => `- ${issue}`).join("\n") || "- Deterministic gates failed; inspect the existing logs and diff."}
+Do not broaden scope. Do not commit. Update worker_summary.json through $CPW_SUMMARY_FILE, clean generated files, and output SELF_EVALUATION: PASS when the focused repair is complete.`;
 }

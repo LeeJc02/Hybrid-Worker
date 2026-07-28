@@ -1,18 +1,23 @@
 #!/usr/bin/env node
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   DEFAULT_MAX_CHANGED_FILES,
   DEFAULT_MAX_DIFF_LINES,
   DEFAULT_MAX_PARALLELISM,
   DEFAULT_MODEL,
   DEFAULT_PERMISSION_MODE,
+  DEFAULT_BROKER_LEASE_SEC,
+  DEFAULT_BROKER_MAX_CALLS,
+  DEFAULT_BROKER_MAX_COST_USD,
+  DEFAULT_BROKER_MAX_READONLY,
+  DEFAULT_BROKER_MAX_WRITE,
   DEFAULT_TEST_TIMEOUT_SEC,
   DEFAULT_WORKER_TIMEOUT_SEC
 } from "./constants.js";
 import { choosePython, parseEnvironmentPolicy } from "./env.js";
-import { currentBranch, ensureGitRepo } from "./git.js";
+import { currentBranch, ensureGitRepo, head } from "./git.js";
 import { writeJson, printJson } from "./json.js";
 import {
   beginIntegration,
@@ -26,37 +31,68 @@ import {
 } from "./merge.js";
 import { parseNamedValue, safeName } from "./parse.js";
 import { buildReport, doctorReport } from "./report.js";
-import { reusedWorkerResult, runWorker } from "./worker.js";
-import { applyPlanToArgs, buildExecutionPhases, preflight } from "./plan.js";
+import { emptyWorkerResult, reusedWorkerResult, runWorker } from "./worker.js";
+import { applyCompiledWorkflowToArgs, applyPlanToArgs, buildExecutionPhases, commandText, preflight } from "./plan.js";
 import { EventLogger } from "./events.js";
 import { commandExists } from "./platform.js";
-import type { CliOptions, EnvironmentPolicy, ExecutionPhase, MergeResult, WorkerResult } from "./types.js";
+import { collectPrework, collectSeedPrework } from "./prework.js";
+import { buildManagerPlans, parentManifest } from "./hierarchical.js";
+import { decideExecutionMode, loadCompiledWorkflow, loadWorkflowSeed, materializeDeclarativeWorkflow, resolveWorkflowPath } from "./workflow.js";
+import { circuitDecision } from "./scheduler.js";
+import { run } from "./process.js";
+import { compileWorkflowFromSeed, type PlanningResult } from "./planning.js";
+import type { CliOptions, CompiledWorkflow, EnvironmentPolicy, ExecutionPhase, MergeResult, ScaleDecision, WorkerResult } from "./types.js";
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const started = performance.now();
   const args = parseArgs(argv);
+  args.fakeScouts = Object.fromEntries(args.fakeScout.map((item) => parseNamedValue(item, "--fake-scout")));
   if (args.doctor) {
     const report = doctorReport(args, choosePython);
     printJson(report);
     return report.status === "ok" ? 0 : 1;
   }
+  if (args.finalizeParentRun) return await finalizeParentRun(args);
   if (!args.taskFile) throw new CliError("--task-file is required unless --doctor is used");
-  const repo = ensureGitRepo(resolve(args.repo), args.repoIgnorePolicy);
-  const loadedPlan = applyPlanToArgs(args, repo);
+  const repo = ensureGitRepo(resolve(args.repo), args.workflowPlanOnly ? "local" : args.repoIgnorePolicy);
+  const workflowSeed = args.workflowSeed ? loadWorkflowSeed(resolveWorkflowPath(repo, args.workflowSeed)) : undefined;
+  let compiledWorkflow = args.compiledWorkflow
+    ? loadCompiledWorkflow(resolveWorkflowPath(repo, args.compiledWorkflow), workflowSeed)
+    : undefined;
+  if (compiledWorkflow) compiledWorkflow = materializeDeclarativeWorkflow(compiledWorkflow);
+  if (args.workflowPlanOnly) {
+    if (!compiledWorkflow && !workflowSeed) throw new CliError("--workflow-plan-only requires --workflow-seed or --compiled-workflow");
+    let prework: Record<string, unknown>;
+    let planning: PlanningResult | undefined;
+    if (!compiledWorkflow) {
+      if (args.executor === "claude" && !commandExists(args.claudeBin)) throw new CliError(`Claude binary not found: ${args.claudeBin}`);
+      prepareRunPaths(args, repo);
+      args.brokerDir ??= join(args.runDir!, "broker");
+      prework = collectSeedPrework(repo, workflowSeed!);
+      planning = await compileWorkflowFromSeed({ repo, seed: workflowSeed!, prework, runDir: args.runDir!, args });
+      compiledWorkflow = planning.workflow;
+      args.compiledWorkflow = planning.workflow_file;
+    } else {
+      prework = collectPrework(repo, compiledWorkflow);
+    }
+    return workflowPlanOnly(args, repo, compiledWorkflow, prework, planning);
+  }
+  const workflowDecision = compiledWorkflow ? decideExecutionMode(compiledWorkflow) : undefined;
+  const loadedPlan = compiledWorkflow ? applyCompiledWorkflowToArgs(args, compiledWorkflow) : applyPlanToArgs(args, repo);
   if (args.worker.length === 0 && args.acceptedBranch.length === 0) throw new CliError("at least one --worker or --accepted-branch is required");
   if (args.executor === "claude" && !commandExists(args.claudeBin)) throw new CliError(`Claude binary not found: ${args.claudeBin}`);
 
-  args.runId ??= `${timestamp()}-${Math.random().toString(16).slice(2, 8)}`;
-  args.runDir = resolve(args.runDir ?? join(repo, ".git", "hybrid-worker", "runs", args.runId));
-  args.worktreeRoot = resolve(args.worktreeRoot ?? join(homedir(), ".codex", "worktrees", "hybrid-worker", args.runId));
-  args.eventsFile = resolve(args.eventsFile ?? join(args.runDir, "events.ndjson"));
-  mkdirSync(args.runDir, { recursive: true });
-  mkdirSync(args.worktreeRoot, { recursive: true });
-  const events = new EventLogger(args.eventsFile, args.runId);
+  prepareRunPaths(args, repo);
+  if (compiledWorkflow) args.brokerDir ??= resolve(args.parentRunDir ?? join(args.runDir!, "broker"));
+  const events = new EventLogger(args.eventsFile!, args.runId!);
   events.emit("run_started", { status: args.dryRun ? "dry_run" : "running", data: { repo, model: args.claudeModel } });
 
-  const taskFile = isAbsolute(args.taskFile) ? args.taskFile : join(repo, args.taskFile);
-  const taskText = readFileSync(taskFile, "utf8");
+  const taskFile = isAbsolute(args.taskFile!) ? args.taskFile! : join(repo, args.taskFile!);
+  let taskText = readFileSync(taskFile, "utf8");
+  if (args.managerId && args.parentRunDir) {
+    const sharedPrework = join(args.parentRunDir, "prework.json");
+    if (existsSync(sharedPrework)) taskText += `\n\n# Shared read-only prework\n${readFileSync(sharedPrework, "utf8")}`;
+  }
 
   const preflightResult = preflight(args, repo);
   events.emit("preflight_completed", { status: preflightResult.ok ? "ok" : "failed", data: { errors: preflightResult.errors, warnings: preflightResult.warnings } });
@@ -70,9 +106,16 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   const testsByWorker = preflightResult.workerTests;
 
   args.fakeImplementers = Object.fromEntries(args.fakeImplementer.map((item) => parseNamedValue(item, "--fake-implementer")));
+  args.fakeVerifiers = Object.fromEntries(args.fakeVerifier.map((item) => parseNamedValue(item, "--fake-verifier")));
+  args.fakeRepairs = Object.fromEntries(args.fakeRepair.map((item) => parseNamedValue(item, "--fake-repair")));
   if (args.executor === "fake-command") {
     const missingImpl = [...workerNames].filter((name) => !(name in args.fakeImplementers)).sort();
     if (missingImpl.length) throw new CliError(`missing fake commands implementer=${JSON.stringify(missingImpl)}`);
+    const missingVerifier = workers
+      .filter((worker) => (worker.verification?.verifier_count ?? 0) > 0 && !(worker.name in args.fakeVerifiers))
+      .map((worker) => worker.name)
+      .sort();
+    if (missingVerifier.length) throw new CliError(`missing fake commands verifier=${JSON.stringify(missingVerifier)}`);
   }
 
   const envPolicy = parseEnvironmentPolicy(args);
@@ -108,9 +151,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       elapsedSec: (performance.now() - started) / 1000,
       envPolicy,
       preflight: preflightResult,
-      phases
+      phases,
+      ...(compiledWorkflow ? { workflow: workflowReportContext(compiledWorkflow, workflowDecision!, args) } : {})
     });
-    const reportPath = resolve(args.jsonReport ?? join(args.runDir, "report.json"));
+    const reportPath = resolve(args.jsonReport ?? join(args.runDir!, "report.json"));
     writeJson(reportPath, report);
     events.emit("run_finished", { status: "preflight_ok", data: { report: reportPath } });
     finishOutput(args, report, reportPath);
@@ -119,7 +163,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
 
   const results: WorkerResult[] = [];
   for (const [name, branch] of Object.entries(acceptedBranches).sort()) {
-    results.push(reusedWorkerResult(name, branch, repo, baseBranch, args.runDir, allowedByWorker[name] ?? [], args));
+    results.push(reusedWorkerResult(name, branch, repo, baseBranch, args.runDir!, allowedByWorker[name] ?? [], args));
     events.emit("worker_reused", { worker: name, status: results.at(-1)?.accepted ? "accepted" : "rejected", data: { branch } });
   }
   const needsIntegrationDuringRun = args.merge || phases.length > 1 || phases.some((phase) => phase.finalTests.length > 0);
@@ -214,9 +258,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     elapsedSec: (performance.now() - started) / 1000,
     envPolicy,
     preflight: preflightResult,
-    phases
+    phases,
+    ...(compiledWorkflow ? { workflow: workflowReportContext(compiledWorkflow, workflowDecision!, args) } : {})
   });
-  const reportPath = resolve(args.jsonReport ?? join(args.runDir, "report.json"));
+  const reportPath = resolve(args.jsonReport ?? join(args.runDir!, "report.json"));
   writeJson(reportPath, report);
   finishOutput(args, report, reportPath);
   if (status !== "merged" && args.merge) {
@@ -241,7 +286,7 @@ async function runPhase(input: {
 }): Promise<WorkerResult[]> {
   const defaultParallelism = Math.min(input.phase.workers.length, DEFAULT_MAX_PARALLELISM);
   const requestedParallelism = input.phase.parallel ? (input.args.parallelism ?? defaultParallelism) : 1;
-  return await mapLimited(input.phase.workers, Math.max(1, requestedParallelism), async (worker) => {
+  const runOne = async (worker: ExecutionPhase["workers"][number], pilot: boolean, batch: number | null): Promise<WorkerResult> => {
     input.events.emit("worker_started", { worker: worker.name, status: "running", data: { phase: input.phase.name } });
     const result = await runWorker({
       worker,
@@ -255,13 +300,94 @@ async function runPhase(input: {
       pythonCommand: input.pythonCommand,
       envPolicy: input.envPolicy
     });
+    result.pilot = pilot;
+    result.batch = batch;
     input.events.emit("worker_finished", {
       worker: worker.name,
       status: result.accepted ? "accepted" : "rejected",
       data: { phase: input.phase.name, findings: result.findings, changed_paths: result.changed_paths }
     });
     return result;
+  };
+  const isDynamicV2 = input.phase.workers.some((worker) => worker.verification != null);
+  if (!isDynamicV2) {
+    return await mapLimited(input.phase.workers, Math.max(1, requestedParallelism), (worker) => runOne(worker, false, null));
+  }
+  const ordered = [...input.phase.workers].sort((left, right) => left.name.localeCompare(right.name));
+  const results: WorkerResult[] = [];
+  const pilot = ordered.shift();
+  if (!pilot) return results;
+  input.events.emit("pilot_started", { worker: pilot.name, status: "running", data: { phase: input.phase.name } });
+  const pilotResult = await runOne(pilot, true, 0);
+  results.push(pilotResult);
+  if (!pilotResult.accepted) {
+    input.events.emit("circuit_open", { status: "open", data: { phase: input.phase.name, reason: "pilot failed" } });
+    results.push(...blockedResults(ordered, "pilot failed; remaining homogeneous tasks were not started"));
+    return results;
+  }
+  for (let index = 0, batch = 1; index < ordered.length; index += 4, batch += 1) {
+    const workers = ordered.slice(index, index + 4);
+    if (!workers.some((worker) => (input.testsByWorker[worker.name] ?? []).length > 0)) {
+      const remaining = ordered.slice(index);
+      input.events.emit("circuit_open", { status: "open", data: { phase: input.phase.name, batch, reason: "batch could not run any tests" } });
+      results.push(...blockedResults(remaining, "circuit opened because the batch could not run any tests", batch));
+      break;
+    }
+    const batchResults = await mapLimited(workers, Math.min(4, Math.max(1, requestedParallelism)), (worker) => runOne(worker, false, batch));
+    results.push(...batchResults);
+    const decision = circuitDecision(
+      batchResults.map((result) => ({ passed: result.accepted, testsRunnable: (input.testsByWorker[result.name] ?? []).length > 0 }))
+    );
+    input.events.emit("batch_finished", { status: decision.open ? "failed" : "accepted", data: { phase: input.phase.name, batch, ...decision } });
+    if (decision.open) {
+      input.events.emit("circuit_open", { status: "open", data: { phase: input.phase.name, batch, reason: decision.reason } });
+      results.push(...blockedResults(ordered.slice(index + workers.length), decision.reason, batch + 1));
+      break;
+    }
+  }
+  return results;
+}
+
+function blockedResults(workers: ExecutionPhase["workers"], reason: string, batch: number | null = null): WorkerResult[] {
+  return workers.map((worker) => {
+    const result = emptyWorkerResultForCircuit(worker.name, reason);
+    result.batch = batch;
+    return result;
   });
+}
+
+function emptyWorkerResultForCircuit(name: string, reason: string): WorkerResult {
+  const result: WorkerResult = {
+    name,
+    branch: "",
+    worktree: "",
+    accepted: false,
+    merged: false,
+    reused: false,
+    commit: null,
+    changed_paths: [],
+    findings: [reason],
+    finding_details: [{ code: "circuit_open", severity: "hard", message: reason, stage: "scheduler" }],
+    implementer: null,
+    verification: [],
+    repair: null,
+    verification_votes: null,
+    pilot: false,
+    batch: null,
+    blocked: true,
+    test_returncode: null,
+    summary_file: "",
+    decision_file: "",
+    diff_file: "",
+    diffstat_file: "",
+    test_log_file: "",
+    elapsed_sec: 0,
+    usage: { status: "not_observed", reason: "blocked before agent call" },
+    codex_fallback_applied: false,
+    codex_fallback_log_file: "",
+    exception: ""
+  };
+  return result;
 }
 
 function writeHuman(args: CliOptions, text: string): void {
@@ -275,6 +401,210 @@ function finishOutput(args: CliOptions, report: Record<string, unknown>, reportP
     return;
   }
   writeHuman(args, `Report: ${reportPath}\n`);
+}
+
+async function finalizeParentRun(args: CliOptions): Promise<number> {
+  const parentPath = resolve(args.finalizeParentRun!);
+  const manifestFile = parentPath.endsWith(".json") ? parentPath : join(parentPath, "parent-run.json");
+  const manifest = JSON.parse(readFileSync(manifestFile, "utf8")) as Record<string, unknown>;
+  const parentRunDir = parentPath.endsWith(".json") ? dirname(parentPath) : parentPath;
+  const repoValue = typeof manifest.repo === "string" ? manifest.repo : args.repo;
+  const repo = ensureGitRepo(resolve(repoValue), "local");
+  const baseCommit = typeof manifest.base_commit === "string" ? manifest.base_commit : "";
+  const runId = typeof manifest.run_id === "string" ? manifest.run_id : `finalize-${timestamp()}`;
+  const workflowFile = typeof manifest.compiled_workflow === "string" ? manifest.compiled_workflow : "";
+  if (!baseCommit || !workflowFile || !Array.isArray(manifest.managers)) throw new CliError("invalid parent-run manifest");
+  const workflow = loadCompiledWorkflow(workflowFile);
+  const decision = decideExecutionMode(workflow);
+  args.runId = runId;
+  args.runDir ??= join(parentRunDir, "finalize");
+  args.worktreeRoot ??= join(parentRunDir, "finalize-worktrees");
+  args.parentRunDir = parentRunDir;
+  args.merge = true;
+  args.test = workflow.final_verification.map((ref) => commandText(workflow.command_catalog[ref]!));
+  prepareRunPaths(args, repo);
+  const events = new EventLogger(args.eventsFile!, args.runId!);
+  events.emit("run_started", { status: "finalizing", data: { repo, parent_run_dir: parentRunDir } });
+  const managerRecords = manifest.managers
+    .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null && !Array.isArray(item))
+    .sort((left, right) => String(left.manager_id).localeCompare(String(right.manager_id)));
+  const managerReports = managerRecords.map((manager) => {
+    const reportFile = join(String(manager.run_dir), "report.json");
+    try {
+      return { manager, report_file: reportFile, report: JSON.parse(readFileSync(reportFile, "utf8")) as Record<string, unknown> };
+    } catch (error) {
+      return { manager, report_file: reportFile, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+  const failures: string[] = [];
+  if (head(repo) !== baseCommit) failures.push("base branch no longer points at the parent-run base commit");
+  for (const entry of managerReports) {
+    const managerId = String(entry.manager.manager_id);
+    const branch = String(entry.manager.branch);
+    if ("error" in entry) {
+      failures.push(`${managerId} report missing or invalid: ${entry.error}`);
+      continue;
+    }
+    if (!entry.report || !["accepted", "merged"].includes(String(entry.report.status))) failures.push(`${managerId} did not complete successfully`);
+    const mergeBase = run(["git", "merge-base", baseCommit, branch], repo, { check: false });
+    if (mergeBase.returncode !== 0 || mergeBase.stdout.trim() !== baseCommit) failures.push(`${managerId} branch is not based on ${baseCommit}`);
+  }
+  if (failures.length) {
+    const report: Record<string, unknown> = {
+      status: "manager_failed",
+      execution_mode: "hierarchical",
+      repo,
+      run_id: runId,
+      base_commit: baseCommit,
+      base_unchanged: head(repo) === baseCommit,
+      failures,
+      managers: managerReports,
+      final_transaction: emptyMergeResult(),
+      recovery_commands: managerRecords.map((manager) => manager.command)
+    };
+    const reportPath = resolve(args.jsonReport ?? join(args.runDir!, "report.json"));
+    writeJson(reportPath, report);
+    events.emit("run_finished", { status: "manager_failed", data: { failures, report: reportPath } });
+    finishOutput(args, report, reportPath);
+    return 1;
+  }
+  const results = managerRecords.map((manager) => {
+    const result = emptyWorkerResult(String(manager.manager_id));
+    result.accepted = true;
+    result.reused = true;
+    result.branch = String(manager.branch);
+    result.worktree = String(manager.worktree);
+    result.commit = run(["git", "rev-parse", result.branch], repo).stdout.trim();
+    return result;
+  });
+  const python = choosePython();
+  const envPolicy = parseEnvironmentPolicy(args);
+  const baseBranch = currentBranch(repo);
+  const merge = await transactionalMerge(repo, baseBranch, results, args, python.command, envPolicy);
+  const status = merge.merged ? "merged" : merge.error.includes("Final verification failed") ? "final_verification_failed" : "merge_failed";
+  const report = {
+    ...buildReport({
+      status,
+      repo,
+      baseBranch,
+      args,
+      workers: [],
+      results,
+      merge,
+      python,
+      elapsedSec: merge.elapsed_sec,
+      envPolicy,
+      workflow: workflowReportContext(workflow, decision, args)
+    }),
+    managers: managerReports,
+    parent_manifest: manifestFile,
+    final_transaction: merge,
+    recovery_commands: managerRecords.map((manager) => manager.command)
+  };
+  const reportPath = resolve(args.jsonReport ?? join(args.runDir!, "report.json"));
+  writeJson(reportPath, report);
+  events.emit("run_finished", { status, data: { report: reportPath, merged: merge.merged } });
+  finishOutput(args, report, reportPath);
+  return merge.merged ? 0 : 1;
+}
+
+function workflowPlanOnly(
+  args: CliOptions,
+  repo: string,
+  workflow: CompiledWorkflow,
+  collectedPrework?: Record<string, unknown>,
+  planning?: PlanningResult
+): number {
+  prepareRunPaths(args, repo);
+  const decision: ScaleDecision = decideExecutionMode(workflow);
+  const events = new EventLogger(args.eventsFile!, args.runId!);
+  events.emit("run_started", { status: "planning", data: { repo, execution_mode: decision.execution_mode } });
+  const prework = collectedPrework ?? collectPrework(repo, workflow);
+  const parentRunDir = resolve(args.parentRunDir ?? args.runDir!);
+  mkdirSync(parentRunDir, { recursive: true });
+  const preworkFile = join(parentRunDir, "prework.json");
+  writeJson(preworkFile, prework);
+  const workflowFile = resolveWorkflowPath(repo, args.compiledWorkflow!);
+  const managers = buildManagerPlans({
+    repo,
+    baseRef: currentBranch(repo),
+    runId: args.runId!,
+    parentRunDir,
+    worktreeRoot: join(args.worktreeRoot!, "managers"),
+    cliPath: process.argv[1] ?? join(repo, "dist", "src", "cli.js"),
+    taskFile: args.taskFile!,
+    workflow,
+    decision,
+    brokerLimits: {
+      maxReadonly: args.brokerMaxReadonly,
+      maxWrite: args.brokerMaxWrite,
+      maxCalls: args.brokerMaxCalls,
+      maxCostUsd: args.brokerMaxCostUsd,
+      leaseSec: args.brokerLeaseSec
+    }
+  });
+  const manifest = parentManifest({ repo, runId: args.runId!, decision, workflowFile, managers });
+  const manifestFile = join(parentRunDir, "parent-run.json");
+  writeJson(manifestFile, manifest);
+  const report: Record<string, unknown> = {
+    status: "planned",
+    version: 2,
+    repo,
+    run_id: args.runId,
+    execution_mode: decision.execution_mode,
+    scale_decision: decision,
+    prework_file: preworkFile,
+    planning: planning
+      ? { workflow_file: planning.workflow_file, scout_outputs: planning.scout_outputs, usage: planning.usage }
+      : { workflow_file: workflowFile, source: "provided_compiled_workflow" },
+    parent_manifest: manifestFile,
+    global_dag: workflow.nodes,
+    manager_subgraphs: managers.map((manager) => ({ manager_id: manager.manager_id, node_ids: manager.node_ids })),
+    managers,
+    global_limits: {
+      readonly_concurrency: args.brokerMaxReadonly,
+      write_concurrency: args.brokerMaxWrite,
+      claude_calls: args.brokerMaxCalls,
+      observed_cost_usd: args.brokerMaxCostUsd,
+      lease_sec: args.brokerLeaseSec
+    },
+    relationships: workflow.nodes.map((node) => ({
+      node: node.id,
+      kind: node.kind,
+      workstream: node.workstream ?? null,
+      route: args.workflowNodes[node.id]?.route ?? null,
+      verification: args.workflowNodes[node.id]?.verification ?? null
+    })),
+    recovery_commands: managers.map((manager) => manager.command)
+  };
+  const reportPath = resolve(args.jsonReport ?? join(args.runDir!, "report.json"));
+  writeJson(reportPath, report);
+  events.emit("run_finished", { status: "planned", data: { report: reportPath, managers: managers.length } });
+  finishOutput(args, report, reportPath);
+  return 0;
+}
+
+function prepareRunPaths(args: CliOptions, repo: string): void {
+  args.runId ??= `${timestamp()}-${Math.random().toString(16).slice(2, 8)}`;
+  args.runDir = resolve(args.runDir ?? join(repo, ".git", "hybrid-worker", "runs", args.runId));
+  args.worktreeRoot = resolve(args.worktreeRoot ?? join(homedir(), ".codex", "worktrees", "hybrid-worker", args.runId));
+  args.eventsFile = resolve(args.eventsFile ?? join(args.runDir, "events.ndjson"));
+  mkdirSync(args.runDir, { recursive: true });
+  mkdirSync(args.worktreeRoot, { recursive: true });
+}
+
+function workflowReportContext(compiled: CompiledWorkflow, decision: ScaleDecision, args: CliOptions): {
+  compiled: CompiledWorkflow;
+  decision: ScaleDecision;
+  manager_id?: string;
+  parent_run_dir?: string;
+} {
+  return {
+    compiled,
+    decision,
+    ...(args.managerId ? { manager_id: args.managerId } : {}),
+    ...(args.parentRunDir ? { parent_run_dir: args.parentRunDir } : {})
+  };
 }
 
 export function parseArgs(argv: string[]): CliOptions {
@@ -298,6 +628,12 @@ export function parseArgs(argv: string[]): CliOptions {
     executor: "claude",
     fakeImplementer: [],
     fakeImplementers: {},
+    fakeVerifier: [],
+    fakeVerifiers: {},
+    fakeRepair: [],
+    fakeRepairs: {},
+    fakeScout: [],
+    fakeScouts: {},
     claudeBin: process.env.CLAUDE_BIN ?? "claude",
     claudeModel: DEFAULT_MODEL,
     permissionMode: DEFAULT_PERMISSION_MODE,
@@ -306,7 +642,14 @@ export function parseArgs(argv: string[]): CliOptions {
     maxChangedFiles: DEFAULT_MAX_CHANGED_FILES,
     maxDiffLines: DEFAULT_MAX_DIFF_LINES,
     workerTimeoutSec: DEFAULT_WORKER_TIMEOUT_SEC,
-    testTimeoutSec: DEFAULT_TEST_TIMEOUT_SEC
+    testTimeoutSec: DEFAULT_TEST_TIMEOUT_SEC,
+    workflowPlanOnly: false,
+    brokerMaxReadonly: DEFAULT_BROKER_MAX_READONLY,
+    brokerMaxWrite: DEFAULT_BROKER_MAX_WRITE,
+    brokerMaxCalls: DEFAULT_BROKER_MAX_CALLS,
+    brokerMaxCostUsd: DEFAULT_BROKER_MAX_COST_USD,
+    brokerLeaseSec: DEFAULT_BROKER_LEASE_SEC,
+    workflowNodes: {}
   };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index]!;
@@ -382,6 +725,18 @@ export function parseArgs(argv: string[]): CliOptions {
       case "--fake-implementer":
         args.fakeImplementer.push(value());
         break;
+      case "--fake-verifier":
+        args.fakeVerifier.push(value());
+        break;
+      case "--fake-repair":
+        args.fakeRepair.push(value());
+        break;
+      case "--fake-planner":
+        args.fakePlanner = value();
+        break;
+      case "--fake-scout":
+        args.fakeScout.push(value());
+        break;
       case "--claude-bin":
         args.claudeBin = value();
         break;
@@ -405,6 +760,42 @@ export function parseArgs(argv: string[]): CliOptions {
         break;
       case "--events-file":
         args.eventsFile = value();
+        break;
+      case "--workflow-seed":
+        args.workflowSeed = value();
+        break;
+      case "--compiled-workflow":
+        args.compiledWorkflow = value();
+        break;
+      case "--workflow-plan-only":
+        args.workflowPlanOnly = true;
+        break;
+      case "--finalize-parent-run":
+        args.finalizeParentRun = value();
+        break;
+      case "--manager-id":
+        args.managerId = safeName(value());
+        break;
+      case "--parent-run-dir":
+        args.parentRunDir = value();
+        break;
+      case "--broker-dir":
+        args.brokerDir = value();
+        break;
+      case "--broker-max-readonly":
+        args.brokerMaxReadonly = parsePositiveInt(value(), flag);
+        break;
+      case "--broker-max-write":
+        args.brokerMaxWrite = parsePositiveInt(value(), flag);
+        break;
+      case "--broker-max-calls":
+        args.brokerMaxCalls = parsePositiveInt(value(), flag);
+        break;
+      case "--broker-max-cost-usd":
+        args.brokerMaxCostUsd = parsePositiveNumber(value(), flag);
+        break;
+      case "--broker-lease-sec":
+        args.brokerLeaseSec = parsePositiveNumber(value(), flag);
         break;
       case "--merge":
         args.merge = true;
@@ -443,6 +834,12 @@ export function parseArgs(argv: string[]): CliOptions {
 function parsePositiveInt(raw: string, flag: string): number {
   const value = Number.parseInt(raw, 10);
   if (!Number.isInteger(value) || value <= 0 || String(value) !== raw) throw new CliError(`${flag} must be a positive integer`);
+  return value;
+}
+
+function parsePositiveNumber(raw: string, flag: string): number {
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) throw new CliError(`${flag} must be a positive number`);
   return value;
 }
 

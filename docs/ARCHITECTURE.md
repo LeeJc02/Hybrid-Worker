@@ -1,6 +1,19 @@
 # hybrid-worker-ts 架构说明
 
-本项目是 Python `hybrid-worker` harness 的 TypeScript 重构。第一阶段目标不是改变 worker 协议，而是把原来集中在单个脚本里的链路拆成可测试模块，并保持 CLI、门禁和报告结构尽量兼容。
+本项目是 `hybrid-worker` harness 的 TypeScript 实现。v1 CLI 与 worker 协议继续兼容；v2 增加声明式 DAG、确定性规模判定、分层 manager 编排、跨进程资源 broker、独立验证和事务恢复。
+
+## v2 分层链路
+
+1. Root Codex 提交 `workflow_seed.json`。若未提供可复用的 `compiled_workflow.json`，`src/planning.ts` 会按 prework 缺口启动只读 scouts，再调用一个 deep planner；fake planner/scout 入口用于无模型费用的集成测试。
+2. `src/prework.ts` 只读采集目录、manifest、测试、依赖、Git base 与路径所有权，并标记 cartographer/test mapper/risk scout 缺口。
+3. `src/workflow.ts` 校验命令授权、结构化引用、受限 `when`/`for_each`、DAG 环、风险下限和模型路由；再以确定性规则选择 `single_layer`、`single_layer_dynamic_dag` 或 `hierarchical`。
+4. 只有安全的大型任务由 `src/hierarchical.ts` 创建 3 个唯一 manager branch/worktree/run dir/subplan。manager 只执行自己的 implementer 子图，不重复全仓 prework。
+5. `src/broker.ts` 用带租约的跨进程状态锁共享 8 个只读槽、4 个写槽、64 次 agent 调用和 10 美元默认可观测成本预算。过期租约自动回收。
+6. `src/scheduler.ts` 按 DAG layer 调度；同质节点先跑一个 pilot，随后每批最多 4 个。通过率低于 2/3 或批次没有可运行测试时熔断并标记剩余节点 blocked。
+7. v2 implementer 只写 summary。medium/high/critical 分别使用 1 balanced、1 deep、3 deep verifier；critical 至少 2 票通过。失败最多运行一次 deep repair，然后完整重跑测试、diff gate 和 verifier。
+8. `--finalize-parent-run` 校验三个 manager 报告和共同 base commit，按 manager ID 固定顺序合入临时 integration，运行最终验证；成功才 fast-forward 基础分支。
+
+模型默认路由为 `fast → haiku`、`balanced → sonnet`、`deep → opus`。high/critical、repair 不允许低于 deep；seed 风险下限不可由 compiled workflow 下调。
 
 ## 核心链路
 

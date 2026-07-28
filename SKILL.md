@@ -17,6 +17,44 @@ node ~/.codex/skills/hybrid-worker/dist/src/cli.js --doctor
 
 Default model is `deepseek-v4-flash`. The harness is implemented in TypeScript and still resolves the worker/test Python command to `conda run -n base python`, then `python3`, then `python`.
 
+## v2 Dynamic And Hierarchical Mode
+
+Hierarchical mode is only for large tasks. Root Codex must not create manager agents merely because hybrid mode was requested. First run the v2 plan-only command and inspect `execution_mode`:
+
+```bash
+node ~/.codex/skills/hybrid-worker/dist/src/cli.js \
+  --repo /path/to/repo \
+  --task-file TASK.md \
+  --workflow-seed workflow_seed.json \
+  --workflow-plan-only
+```
+
+With seed only, the harness runs the required read-only cartographer/test-mapper/risk-scout stages, then one deep planner and validates its output. Pass `--compiled-workflow` as well only when reusing an already generated planner artifact; the harness still enforces seed command authority and risk floors.
+
+- `single_layer`: fewer than 12 required write nodes. Root Codex runs one hybrid-worker process.
+- `single_layer_dynamic_dag`: at least 12 write nodes, but the graph cannot safely form exactly 3 independent domains. Root Codex still runs one process.
+- `hierarchical`: and only this value authorizes Root Codex to create exactly 3 Codex managers using the generated commands in `report.json`.
+
+Hierarchical eligibility is deterministic: at least 12 required write nodes; exactly 3 workstreams; at least 3 implementers in every workstream; no cross-workstream write-path overlap; no cross-domain implementation dependency; complete final verification; and any shared contract is frozen with one owner. If a shared contract cannot be frozen first, use single-layer mode.
+
+Each manager must:
+
+- use only its generated branch, worktree, run directory, and compiled subplan;
+- read the shared parent prework but never repeat whole-repo prework;
+- call hybrid-worker itself instead of creating more Codex subagents;
+- pass the shared `--broker-dir` and generated broker limits unchanged;
+- return only compact status, branch, verification, risk, usage, and recovery data to Root Codex.
+
+All managers may finish their current batch after one manager fails, but Root Codex must not merge anything. After all three succeed, Root Codex runs:
+
+```bash
+node ~/.codex/skills/hybrid-worker/dist/src/cli.js --finalize-parent-run /path/to/parent-run
+```
+
+This checks the common base commit, merges manager branches in stable manager-ID order into a temporary integration branch, runs final verification, and fast-forwards the original branch only on total success. Successful manager branches and checkpoints remain reusable after failure.
+
+The v2 seed is the command authority. `compiled_workflow.json` may reference only seed-defined `command_catalog` entries (`argv` plus optional safe repo-relative `cwd`); it must never contain model-generated JavaScript or new bare shell commands. Implementers do not self-sign review in v2. The harness owns deterministic gates and independent verifier quorum, with at most one deep repair followed by a full verification rerun.
+
 ## Default Workflow
 
 1. Codex planner reads the task/spec lightly and writes `worker_plan.json`, shared `CLAUDE.md`, and `tickets/*.md`.

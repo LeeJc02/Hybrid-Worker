@@ -1,5 +1,10 @@
 export type ExecutorKind = "claude" | "fake-command";
 export type RepoIgnorePolicy = "tracked" | "local";
+export type ExecutionMode = "single_layer" | "single_layer_dynamic_dag" | "hierarchical";
+export type AgentAccess = "readonly" | "write";
+export type ModelRoute = "fast" | "balanced" | "deep";
+export type RiskLevel = "low" | "medium" | "high" | "critical";
+export type WorkflowNodeKind = "scout" | "planner" | "shared_contract" | "implementer" | "verifier" | "repair";
 
 export type FindingSeverity = "hard" | "soft";
 
@@ -22,6 +27,10 @@ export type FindingCode =
   | "summary_invalid_json"
   | "summary_schema_invalid"
   | "tests_failed"
+  | "verifier_failed"
+  | "verifier_modified_worktree"
+  | "repair_failed"
+  | "circuit_open"
   | "worker_crashed";
 
 export interface GateFinding {
@@ -36,6 +45,12 @@ export interface WorkerSpec {
   name: string;
   ticket: string;
   allowedPaths: string[];
+  risk?: RiskLevel;
+  route?: ModelRoute;
+  model?: "haiku" | "sonnet" | "opus";
+  effort?: "low" | "medium" | "high";
+  fallback?: ModelRoute;
+  verification?: VerificationPolicy;
 }
 
 export interface StageResult {
@@ -47,6 +62,9 @@ export interface StageResult {
   usage: Usage;
   usage_file: string;
   result_file: string;
+  broker_wait_sec?: number;
+  model_route?: ModelRoute;
+  model?: string;
 }
 
 export interface WorkerResult {
@@ -61,6 +79,12 @@ export interface WorkerResult {
   findings: string[];
   finding_details: GateFinding[];
   implementer: StageResult | null;
+  verification: StageResult[];
+  repair: StageResult | null;
+  verification_votes: { passed: number; required: number; total: number } | null;
+  pilot: boolean;
+  batch: number | null;
+  blocked: boolean;
   test_returncode: number | null;
   summary_file: string;
   decision_file: string;
@@ -95,6 +119,9 @@ export type RunEventType =
   | "worker_started"
   | "worker_finished"
   | "worker_reused"
+  | "pilot_started"
+  | "batch_finished"
+  | "circuit_open"
   | "merge_started"
   | "merge_finished"
   | "run_finished";
@@ -144,6 +171,13 @@ export interface CliOptions {
   executor: ExecutorKind;
   fakeImplementer: string[];
   fakeImplementers: Record<string, string>;
+  fakeVerifier: string[];
+  fakeVerifiers: Record<string, string>;
+  fakeRepair: string[];
+  fakeRepairs: Record<string, string>;
+  fakePlanner?: string;
+  fakeScout: string[];
+  fakeScouts: Record<string, string>;
   claudeBin: string;
   claudeModel: string;
   permissionMode: string;
@@ -161,6 +195,19 @@ export interface CliOptions {
   workerTimeoutSec: number;
   testTimeoutSec: number;
   eventsFile?: string;
+  workflowSeed?: string;
+  compiledWorkflow?: string;
+  workflowPlanOnly: boolean;
+  finalizeParentRun?: string;
+  managerId?: string;
+  parentRunDir?: string;
+  brokerDir?: string;
+  brokerMaxReadonly: number;
+  brokerMaxWrite: number;
+  brokerMaxCalls: number;
+  brokerMaxCostUsd: number;
+  brokerLeaseSec: number;
+  workflowNodes: Record<string, Omit<WorkerSpec, "name" | "ticket" | "allowedPaths">>;
 }
 
 export interface PythonChoice {
@@ -206,4 +253,109 @@ export interface ExecutionPhase {
   parallel: boolean;
   workers: WorkerSpec[];
   finalTests: string[];
+}
+
+export interface CommandSpec {
+  argv: string[];
+  cwd?: string;
+}
+
+export interface WorkflowSeedNode {
+  id: string;
+  kind: WorkflowNodeKind;
+  required?: boolean;
+  risk_floor?: RiskLevel;
+  paths?: string[];
+}
+
+export interface WorkflowSeed {
+  version: 2;
+  run_id?: string;
+  objective: string;
+  command_catalog: Record<string, CommandSpec>;
+  nodes?: WorkflowSeedNode[];
+  final_verification: string[];
+}
+
+export interface WorkflowReference {
+  node: string;
+  output: string;
+}
+
+export interface WorkflowForEach {
+  ref: WorkflowReference;
+  item_name?: string;
+}
+
+export interface WorkflowCondition {
+  ref: WorkflowReference;
+  exists?: boolean;
+  equals?: string | number | boolean | null;
+  in?: Array<string | number | boolean | null>;
+}
+
+export interface WorkflowNode {
+  id: string;
+  kind: WorkflowNodeKind;
+  required: boolean;
+  workstream?: string;
+  owner?: string;
+  depends_on: string[];
+  paths: string[];
+  ticket?: string;
+  ticket_text?: string;
+  command_refs: string[];
+  risk: RiskLevel;
+  route?: ModelRoute;
+  effort?: "low" | "medium" | "high";
+  fallback?: ModelRoute;
+  for_each?: WorkflowForEach;
+  when?: WorkflowCondition;
+  inputs?: Record<string, WorkflowReference>;
+  outputs?: Record<string, unknown>;
+  item?: unknown;
+  template_id?: string;
+}
+
+export interface CompiledWorkflow {
+  version: 2;
+  run_id?: string;
+  base_commit?: string;
+  objective: string;
+  command_catalog: Record<string, CommandSpec>;
+  nodes: WorkflowNode[];
+  final_verification: string[];
+  shared_contract_frozen?: boolean;
+}
+
+export interface ScaleDecision {
+  execution_mode: ExecutionMode;
+  required_write_nodes: number;
+  workstreams: string[];
+  reasons: string[];
+}
+
+export interface ModelSelection {
+  route: ModelRoute;
+  model: "haiku" | "sonnet" | "opus";
+  effort: "low" | "medium" | "high";
+  fallback?: ModelRoute;
+}
+
+export interface VerificationPolicy {
+  route: ModelRoute;
+  verifier_count: number;
+  required_passes: number;
+  repair_route: "deep";
+  max_repairs: 1;
+}
+
+export interface ManagerPlan {
+  manager_id: string;
+  branch: string;
+  worktree: string;
+  run_dir: string;
+  workflow_file: string;
+  command: string[];
+  node_ids: string[];
 }

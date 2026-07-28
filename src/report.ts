@@ -3,6 +3,11 @@ import {
   DEFAULT_MAX_DIFF_LINES,
   DEFAULT_MAX_PARALLELISM,
   DEFAULT_MODEL,
+  DEFAULT_BROKER_LEASE_SEC,
+  DEFAULT_BROKER_MAX_CALLS,
+  DEFAULT_BROKER_MAX_COST_USD,
+  DEFAULT_BROKER_MAX_READONLY,
+  DEFAULT_BROKER_MAX_WRITE,
   DEFAULT_TEST_TIMEOUT_SEC,
   DEFAULT_WORKER_TIMEOUT_SEC,
   GENERATED_ARTIFACT_DIRS,
@@ -12,7 +17,19 @@ import {
 import { sharedCachePolicy } from "./env.js";
 import { commandExists } from "./platform.js";
 import { combineUsage } from "./usage.js";
-import type { CliOptions, EnvironmentPolicy, ExecutionPhase, MergeResult, PreflightResult, PythonChoice, WorkerResult, WorkerSpec } from "./types.js";
+import { ResourceBroker } from "./broker.js";
+import type {
+  CliOptions,
+  CompiledWorkflow,
+  EnvironmentPolicy,
+  ExecutionPhase,
+  MergeResult,
+  PreflightResult,
+  PythonChoice,
+  ScaleDecision,
+  WorkerResult,
+  WorkerSpec
+} from "./types.js";
 
 export function buildReport(input: {
   status: string;
@@ -27,6 +44,12 @@ export function buildReport(input: {
   envPolicy: EnvironmentPolicy;
   preflight?: PreflightResult;
   phases?: ExecutionPhase[];
+  workflow?: {
+    compiled: CompiledWorkflow;
+    decision: ScaleDecision;
+    manager_id?: string;
+    parent_run_dir?: string;
+  };
 }): Record<string, unknown> {
   const workerUsage = Object.fromEntries(input.results.map((result) => [result.name, result.usage]));
   return {
@@ -45,6 +68,20 @@ export function buildReport(input: {
       final_tests: phase.finalTests
     })),
     workers: input.results,
+    pilot: input.workflow ? input.results.find((result) => result.pilot)?.name ?? null : undefined,
+    batches: input.workflow
+      ? Object.values(
+          input.results.reduce<Record<string, string[]>>((groups, result) => {
+            if (result.batch == null) return groups;
+            (groups[String(result.batch)] ??= []).push(result.name);
+            return groups;
+          }, {})
+        )
+      : undefined,
+    blocked_nodes: input.workflow ? input.results.filter((result) => result.blocked).map((result) => result.name) : undefined,
+    circuit_breakers: input.workflow
+      ? input.results.filter((result) => result.finding_details.some((item) => item.code === "circuit_open")).map((result) => ({ node: result.name, findings: result.findings }))
+      : undefined,
     merge: input.merge,
     timing: {
       elapsed_sec: input.elapsedSec,
@@ -58,7 +95,36 @@ export function buildReport(input: {
       total: combineUsage(input.results.map((result) => result.usage))
     },
     resume_commands: buildResumeCommands(input.args, input.results),
-    workflow_mode: "single_call_worker_self_review",
+    workflow_mode: input.workflow ? "declarative_dynamic_dag" : "single_call_worker_self_review",
+    execution_mode: input.workflow?.decision.execution_mode ?? "single_layer",
+    scale_decision: input.workflow?.decision,
+    global_dag: input.workflow?.compiled.nodes,
+    manager: input.workflow
+      ? {
+          id: input.workflow.manager_id,
+          parent_run_dir: input.workflow.parent_run_dir,
+          branch: input.baseBranch
+        }
+      : undefined,
+    routing: input.workflow
+      ? Object.fromEntries(
+          input.workers.map((worker) => [
+            worker.name,
+            { risk: worker.risk, route: worker.route, model: worker.model, effort: worker.effort, fallback: worker.fallback, verification: worker.verification }
+          ])
+        )
+      : undefined,
+    global_limits: input.workflow
+      ? {
+          readonly_concurrency: input.args.brokerMaxReadonly,
+          write_concurrency: input.args.brokerMaxWrite,
+          claude_calls: input.args.brokerMaxCalls,
+          observed_cost_usd: input.args.brokerMaxCostUsd,
+          lease_sec: input.args.brokerLeaseSec,
+          broker_dir: input.args.brokerDir
+        }
+      : undefined,
+    broker: input.workflow && input.args.brokerDir ? brokerSnapshot(input.args) : undefined,
     events_file: input.args.eventsFile,
     preflight: input.preflight
       ? { ok: input.preflight.ok, errors: input.preflight.errors, warnings: input.preflight.warnings }
@@ -81,6 +147,20 @@ export function buildReport(input: {
       shared_cache_env: sharedCachePolicy()
     }
   };
+}
+
+function brokerSnapshot(args: CliOptions): unknown {
+  try {
+    return new ResourceBroker(args.brokerDir!, {
+      maxReadonly: args.brokerMaxReadonly,
+      maxWrite: args.brokerMaxWrite,
+      maxCalls: args.brokerMaxCalls,
+      maxCostUsd: args.brokerMaxCostUsd,
+      leaseSec: args.brokerLeaseSec
+    }).snapshot();
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 export function doctorReport(args: CliOptions, pythonProbe: () => PythonChoice): Record<string, unknown> {
@@ -109,7 +189,16 @@ export function doctorReport(args: CliOptions, pythonProbe: () => PythonChoice):
       worker_timeout_sec: DEFAULT_WORKER_TIMEOUT_SEC,
       test_timeout_sec: DEFAULT_TEST_TIMEOUT_SEC,
       max_changed_files: DEFAULT_MAX_CHANGED_FILES,
-      max_diff_lines: DEFAULT_MAX_DIFF_LINES
+      max_diff_lines: DEFAULT_MAX_DIFF_LINES,
+      v2: {
+        hierarchical_min_required_writes: 12,
+        manager_count: 3,
+        max_readonly_agents: DEFAULT_BROKER_MAX_READONLY,
+        max_write_workers: DEFAULT_BROKER_MAX_WRITE,
+        max_agent_calls: DEFAULT_BROKER_MAX_CALLS,
+        max_observed_cost_usd: DEFAULT_BROKER_MAX_COST_USD,
+        lease_sec: DEFAULT_BROKER_LEASE_SEC
+      }
     }
   };
 }

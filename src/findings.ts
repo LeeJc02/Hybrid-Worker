@@ -5,6 +5,9 @@ const HARD_CODES = new Set<FindingCode>([
   "missing_marker",
   "missing_summary",
   "summary_invalid_json",
+  "verifier_failed",
+  "verifier_modified_worktree",
+  "repair_failed",
   "worker_crashed"
 ]);
 

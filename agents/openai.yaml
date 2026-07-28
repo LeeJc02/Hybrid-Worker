@@ -1,4 +1,4 @@
 interface:
   display_name: "Hybrid Worker"
-  short_description: "Explicit hybrid mode with parallel Claude workers and deterministic merge gates"
-  default_prompt: "Use $hybrid-worker for hybrid mode: Codex plans worker tickets, Claude workers implement in parallel, and the harness merges only after deterministic gates and tests pass."
+  short_description: "Dynamic DAG hybrid mode with bounded Claude workers and transactional manager merges"
+  default_prompt: "Use $hybrid-worker for explicit hybrid mode. Run v2 plan-only first; create exactly three Codex managers only when execution_mode is hierarchical, keep all Claude stages behind the shared broker, and finalize through the parent-run transaction."

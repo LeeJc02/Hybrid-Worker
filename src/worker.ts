@@ -4,7 +4,7 @@ import { DEFAULT_MODEL, PASS_MARKER } from "./constants.js";
 import { cleanupGeneratedNoise, diffLineCount, generatedArtifactFindings, pathAllowed, restoreUnownedScaffoldChanges } from "./artifacts.js";
 import { commitIfNeeded, collectEvidence, createWorktree, baseWorktreeDirty } from "./git.js";
 import { writeJson } from "./json.js";
-import { implementerPrompt, prepareWorkerPromptFiles, sanitizeWorkerText } from "./prompt.js";
+import { implementerPrompt, prepareWorkerPromptFiles, repairPrompt, sanitizeWorkerText, verifierPrompt } from "./prompt.js";
 import { run, runCommandSequence, runToLog, shellRun } from "./process.js";
 import {
   normalizeDecisionSchema,
@@ -16,6 +16,7 @@ import {
 import { claudeResultText, combineUsage, parseClaudePayloadFromLog, parseClaudeUsage } from "./usage.js";
 import { notObservedUsage, shellEnv, workerEnvironmentSetupCommands } from "./env.js";
 import { addFinding, addSchemaFindings, finding, hasHardFindings } from "./findings.js";
+import { ResourceBroker, type BrokerLease } from "./broker.js";
 import type { CliOptions, EnvironmentPolicy, StageResult, Usage, WorkerResult, WorkerSpec } from "./types.js";
 
 export function emptyWorkerResult(name: string): WorkerResult {
@@ -31,6 +32,12 @@ export function emptyWorkerResult(name: string): WorkerResult {
     findings: [],
     finding_details: [],
     implementer: null,
+    verification: [],
+    repair: null,
+    verification_votes: null,
+    pilot: false,
+    batch: null,
+    blocked: false,
     test_returncode: null,
     summary_file: "",
     decision_file: "",
@@ -45,7 +52,7 @@ export function emptyWorkerResult(name: string): WorkerResult {
   };
 }
 
-export function claudeCmd(args: CliOptions): string[] {
+export function claudeCmd(args: CliOptions, model = args.claudeModel): string[] {
   return [
     args.claudeBin,
     "-p",
@@ -53,7 +60,7 @@ export function claudeCmd(args: CliOptions): string[] {
     "json",
     "--disable-slash-commands",
     "--model",
-    args.claudeModel,
+    model,
     "--no-session-persistence",
     "--permission-mode",
     args.permissionMode
@@ -67,7 +74,9 @@ export async function runStage(
   worktree: string,
   runDir: string,
   env: NodeJS.ProcessEnv,
-  args: CliOptions
+  args: CliOptions,
+  modelOverride?: string,
+  routeOverride?: "fast" | "balanced" | "deep"
 ): Promise<StageResult> {
   const logFile = join(runDir, `${worker.name}.${stage}.log`);
   const usageFile = join(runDir, `${worker.name}.${stage}.usage.json`);
@@ -75,25 +84,67 @@ export async function runStage(
   let code: number;
   let elapsedSec: number;
   let usage: Usage;
-  if (args.executor === "fake-command") {
-    const command = args.fakeImplementers[worker.name];
-    if (!command) throw new Error(`Missing fake implementer command for worker ${worker.name}`);
-    const result = await runToLog(["/bin/sh", "-lc", command], worktree, logFile, { env, timeoutSec: args.workerTimeoutSec });
-    code = result.returncode;
-    elapsedSec = result.elapsedSec;
-    usage = notObservedUsage("fake executor");
-    writeFileSync(resultFile, readFileSync(logFile, "utf8"), "utf8");
-  } else {
-    const result = await runToLog(claudeCmd(args), worktree, logFile, { inputText: prompt, env, timeoutSec: args.workerTimeoutSec });
-    code = result.returncode;
-    elapsedSec = result.elapsedSec;
-    const payload = parseClaudePayloadFromLog(logFile);
-    usage = parseClaudeUsage(payload);
-    writeFileSync(resultFile, claudeResultText(payload), "utf8");
+  const broker = args.brokerDir
+    ? new ResourceBroker(args.brokerDir, {
+        maxReadonly: args.brokerMaxReadonly,
+        maxWrite: args.brokerMaxWrite,
+        maxCalls: args.brokerMaxCalls,
+        maxCostUsd: args.brokerMaxCostUsd,
+        leaseSec: args.brokerLeaseSec
+      })
+    : null;
+  let lease: BrokerLease | null = null;
+  let renewTimer: NodeJS.Timeout | null = null;
+  try {
+    if (broker) {
+      lease = await broker.acquire(stage.startsWith("verifier") ? "readonly" : "write", `${args.runId}:${worker.name}:${stage}`, args.workerTimeoutSec);
+      renewTimer = setInterval(() => broker.renew(lease!.id), Math.max(1000, (args.brokerLeaseSec * 1000) / 2));
+    }
+    if (args.executor === "fake-command") {
+      const command = fakeStageCommand(args, worker.name, stage);
+      if (!command) throw new Error(`Missing fake ${stage} command for worker ${worker.name}`);
+      const result = await runToLog(["/bin/sh", "-lc", command], worktree, logFile, { env, timeoutSec: args.workerTimeoutSec });
+      code = result.returncode;
+      elapsedSec = result.elapsedSec;
+      usage = notObservedUsage("fake executor");
+      writeFileSync(resultFile, readFileSync(logFile, "utf8"), "utf8");
+    } else {
+      const result = await runToLog(claudeCmd(args, modelOverride ?? worker.model), worktree, logFile, { inputText: prompt, env, timeoutSec: args.workerTimeoutSec });
+      code = result.returncode;
+      elapsedSec = result.elapsedSec;
+      const payload = parseClaudePayloadFromLog(logFile);
+      usage = parseClaudeUsage(payload);
+      writeFileSync(resultFile, claudeResultText(payload), "utf8");
+    }
+  } finally {
+    if (renewTimer) clearInterval(renewTimer);
+    if (broker && lease) broker.release(lease.id, observedCost(usage!));
   }
   writeJson(usageFile, usage);
   const markerFound = readFileSync(resultFile, "utf8").includes(PASS_MARKER) || readFileSync(logFile, "utf8").includes(PASS_MARKER);
-  return { stage, returncode: code, log_file: logFile, marker_found: markerFound, elapsed_sec: elapsedSec, usage, usage_file: usageFile, result_file: resultFile };
+  return {
+    stage,
+    returncode: code,
+    log_file: logFile,
+    marker_found: markerFound,
+    elapsed_sec: elapsedSec,
+    usage,
+    usage_file: usageFile,
+    result_file: resultFile,
+    ...(lease ? { broker_wait_sec: lease.wait_sec } : {}),
+    ...(routeOverride ?? worker.route ? { model_route: routeOverride ?? worker.route } : {}),
+    ...(modelOverride ?? worker.model ? { model: modelOverride ?? worker.model } : {})
+  };
+}
+
+function fakeStageCommand(args: CliOptions, worker: string, stage: string): string | undefined {
+  if (stage.startsWith("verifier")) return args.fakeVerifiers[worker];
+  if (stage === "repair") return args.fakeRepairs[worker];
+  return args.fakeImplementers[worker];
+}
+
+function observedCost(usage: Usage): number {
+  return typeof usage.total_cost_usd === "number" ? usage.total_cost_usd : 0;
 }
 
 export async function runWorker(input: {
@@ -137,7 +188,8 @@ export async function runWorker(input: {
       tests: input.workerTests,
       allowedPaths: input.allowedPaths,
       worktree: created.worktree,
-      baseRepo: input.repo
+      baseRepo: input.repo,
+      independentReview: input.worker.verification != null
     });
     result.implementer = await runStage("implementer", input.worker, prompt, created.worktree, input.runDir, env, input.args);
     result.usage = combineUsage([result.implementer.usage]);
@@ -177,6 +229,21 @@ export async function runWorker(input: {
       } catch (error) {
         addFinding(result, finding("summary_invalid_json", `Invalid worker_summary.json: ${error instanceof Error ? error.message : String(error)}`, { stage: "summary" }));
       }
+    }
+
+    if (input.worker.verification) {
+      return await finishV2Worker({
+        input,
+        result,
+        created,
+        env,
+        setupCommands,
+        summaryFile,
+        testLog,
+        diffFile,
+        diffstatFile,
+        started
+      });
     }
 
     if (hasHardFindings(result) && !input.args.codexFallbackCommand) return finishFailure(result, input.runDir, started);
@@ -251,6 +318,226 @@ export async function runWorker(input: {
     writeWorkerFailureJson(input.runDir, result);
     return result;
   }
+}
+
+async function finishV2Worker(context: {
+  input: {
+    worker: WorkerSpec;
+    repo: string;
+    baseBranch: string;
+    taskText: string;
+    workerTests: string[];
+    allowedPaths: string[];
+    runDir: string;
+    args: CliOptions;
+    pythonCommand: string;
+    envPolicy: EnvironmentPolicy;
+  };
+  result: WorkerResult;
+  created: { branch: string; worktree: string };
+  env: NodeJS.ProcessEnv;
+  setupCommands: string[];
+  summaryFile: string;
+  testLog: string;
+  diffFile: string;
+  diffstatFile: string;
+  started: number;
+}): Promise<WorkerResult> {
+  const { input, result, created } = context;
+  refreshV2Evidence(context, false);
+  let repaired = false;
+  if (result.findings.length) {
+    if (hasUnrepairableV2Finding(result) || !(await runV2Repair(context, result.findings))) return finishFailure(result, input.runDir, context.started);
+    repaired = true;
+    await rerunV2DeterministicGates(context);
+  }
+  if (result.findings.length === 0) {
+    const verification = await runV2Verification(context, repaired ? 2 : 1);
+    if (!verification.passed) {
+      addFinding(result, finding("verifier_failed", `Independent verification failed: ${verification.issues.join("; ")}`, { stage: "verification" }));
+      if (!repaired && (await runV2Repair(context, verification.issues))) {
+        repaired = true;
+        await rerunV2DeterministicGates(context);
+        if (result.findings.length === 0) {
+          const retry = await runV2Verification(context, 2);
+          if (!retry.passed) addFinding(result, finding("verifier_failed", `Independent verification failed after repair: ${retry.issues.join("; ")}`, { stage: "verification" }));
+        }
+      }
+    }
+  }
+  result.usage = combineUsage([
+    ...(result.implementer ? [result.implementer.usage] : []),
+    ...result.verification.map((stage) => stage.usage),
+    ...(result.repair ? [result.repair.usage] : [])
+  ]);
+  if (result.findings.length === 0) {
+    result.commit = commitIfNeeded(created.worktree, input.worker.name);
+    result.accepted = true;
+  } else {
+    writeWorkerFailureJson(input.runDir, result);
+  }
+  result.elapsed_sec = (performance.now() - context.started) / 1000;
+  return result;
+}
+
+async function rerunV2DeterministicGates(context: Parameters<typeof finishV2Worker>[0]): Promise<void> {
+  const { input, result, created } = context;
+  result.findings = [];
+  result.finding_details = [];
+  result.test_returncode = await runCommandSequence(
+    context.setupCommands,
+    input.workerTests,
+    created.worktree,
+    context.testLog,
+    context.env,
+    input.args.testTimeoutSec
+  );
+  cleanupGeneratedNoise(created.worktree);
+  if (result.test_returncode !== null && result.test_returncode !== 0) {
+    addFinding(result, finding("tests_failed", `Worker tests failed after repair with exit code ${result.test_returncode}.`, { stage: "repair_tests" }));
+  }
+  validateV2Summary(result, context.summaryFile, "repair_summary");
+  refreshV2Evidence(context, false);
+}
+
+function refreshV2Evidence(context: Parameters<typeof finishV2Worker>[0], clear = false): void {
+  const { input, result, created } = context;
+  if (clear) {
+    result.findings = [];
+    result.finding_details = [];
+  }
+  cleanupGeneratedNoise(created.worktree);
+  restoreUnownedScaffoldChanges(created.worktree, input.allowedPaths);
+  const evidence = collectEvidence(created.worktree, input.baseBranch, context.diffFile, context.diffstatFile);
+  result.changed_paths = evidence.changed;
+  gateDiff(result, evidence.diff, input.allowedPaths, input.args);
+}
+
+function validateV2Summary(result: WorkerResult, summaryFile: string, stage: string): void {
+  if (!existsSync(summaryFile)) {
+    addFinding(result, finding("missing_summary", "Missing worker_summary.json.", { stage }));
+    return;
+  }
+  try {
+    addSchemaFindings(result, "summary_schema_invalid", validateSummarySchema(readNormalizedJson(summaryFile, normalizeSummarySchema)), stage);
+  } catch (error) {
+    addFinding(result, finding("summary_invalid_json", `Invalid worker_summary.json: ${error instanceof Error ? error.message : String(error)}`, { stage }));
+  }
+}
+
+async function runV2Repair(context: Parameters<typeof finishV2Worker>[0], issues: string[]): Promise<boolean> {
+  const { input, result, created } = context;
+  if (input.args.executor === "fake-command" && !input.args.fakeRepairs[input.worker.name]) return false;
+  try {
+    const stage = await runStage(
+      "repair",
+      input.worker,
+      repairPrompt({ worker: input.worker.name, worktree: created.worktree, issues }),
+      created.worktree,
+      input.runDir,
+      { ...context.env, CPW_REPAIR_ISSUES: JSON.stringify(issues) },
+      input.args,
+      "opus",
+      "deep"
+    );
+    result.repair = stage;
+    if (stage.returncode !== 0 || !stage.marker_found) {
+      addFinding(result, finding("repair_failed", `Deep repair failed for ${input.worker.name}.`, { stage: "repair" }));
+      return false;
+    }
+    return true;
+  } catch (error) {
+    addFinding(result, finding("repair_failed", `Deep repair crashed: ${error instanceof Error ? error.message : String(error)}`, { stage: "repair" }));
+    return false;
+  }
+}
+
+async function runV2Verification(
+  context: Parameters<typeof finishV2Worker>[0],
+  round: number
+): Promise<{ passed: boolean; issues: string[] }> {
+  const { input, result, created } = context;
+  const policy = input.worker.verification!;
+  const decisionFile = join(input.runDir, `${input.worker.name}.reviewer_decision.json`);
+  result.decision_file = decisionFile;
+  if (policy.verifier_count === 0) {
+    writeJson(decisionFile, harnessDecision(input.worker.name, "PASS", []));
+    result.verification_votes = { passed: 0, required: 0, total: 0 };
+    return { passed: true, issues: [] };
+  }
+  let passed = 0;
+  const issues: string[] = [];
+  for (let index = 0; index < policy.verifier_count; index += 1) {
+    const verifierDecisionFile = join(input.runDir, `${input.worker.name}.verifier-${round}-${index + 1}.json`);
+    const before = worktreeFingerprint(created.worktree);
+    let stage: StageResult;
+    try {
+      stage = await runStage(
+        `verifier-r${round}-${index + 1}`,
+        input.worker,
+        verifierPrompt({
+          worker: input.worker.name,
+          worktree: created.worktree,
+          diffFile: context.diffFile,
+          testLogFile: context.testLog,
+          decisionFile: verifierDecisionFile
+        }),
+        created.worktree,
+        input.runDir,
+        { ...context.env, CPW_DECISION_FILE: verifierDecisionFile },
+        input.args,
+        policy.route === "deep" ? "opus" : "sonnet",
+        policy.route
+      );
+      result.verification.push(stage);
+    } catch (error) {
+      issues.push(`verifier ${index + 1} crashed: ${error instanceof Error ? error.message : String(error)}`);
+      continue;
+    }
+    const after = worktreeFingerprint(created.worktree);
+    if (after !== before) {
+      issues.push(`verifier ${index + 1} modified the worktree`);
+      addFinding(result, finding("verifier_modified_worktree", `Verifier ${index + 1} modified the worker worktree.`, { stage: stage.stage }));
+      continue;
+    }
+    if (stage.returncode !== 0 || !stage.marker_found || !existsSync(verifierDecisionFile)) {
+      issues.push(`verifier ${index + 1} did not produce a passing decision`);
+      continue;
+    }
+    try {
+      const decision = readNormalizedJson(verifierDecisionFile, normalizeDecisionSchema);
+      const errors = validateDecisionSchema(decision);
+      if (errors.length === 0) passed += 1;
+      else issues.push(...errors.map((message) => `verifier ${index + 1}: ${message}`));
+    } catch (error) {
+      issues.push(`verifier ${index + 1} decision is invalid: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  const accepted = passed >= policy.required_passes && !result.finding_details.some((item) => item.code === "verifier_modified_worktree");
+  result.verification_votes = { passed, required: policy.required_passes, total: policy.verifier_count };
+  writeJson(decisionFile, harnessDecision(input.worker.name, accepted ? "PASS" : "FAIL", issues));
+  return { passed: accepted, issues };
+}
+
+function harnessDecision(worker: string, decision: "PASS" | "FAIL", issues: string[]): Record<string, unknown> {
+  return {
+    worker,
+    decision,
+    issues_found: issues,
+    fixes_applied: [],
+    tests_run: [],
+    tests_passed: decision === "PASS",
+    merge_risk: decision === "PASS" ? "low" : "high",
+    source: "hybrid-worker-v2-harness"
+  };
+}
+
+function worktreeFingerprint(worktree: string): string {
+  return `${run(["git", "status", "--porcelain"], worktree, { check: false }).stdout}\n${run(["git", "diff", "--binary"], worktree, { check: false }).stdout}`;
+}
+
+function hasUnrepairableV2Finding(result: WorkerResult): boolean {
+  return result.finding_details.some((item) => item.code === "implementer_failed" || item.code === "missing_marker" || item.code === "base_repo_dirty");
 }
 
 export function reusedWorkerResult(

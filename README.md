@@ -2,6 +2,8 @@
 
 `hybrid-worker-ts` 是 `hybrid-worker` skill harness 的 TypeScript 实现。
 
+v2 在兼容原有 `worker_plan.json` 的基础上新增声明式动态 DAG 与大型任务专属的三级执行面：Root Codex 只负责计划和最终事务合并，3 个 Codex manager 各自在唯一 worktree 中调用本 harness，所有 Claude stages 共享一个跨进程资源 broker。
+
 目标：
 
 - 保持 Python 版 CLI、worker 契约、门禁、事务性合并和 `report.json` 结构的兼容基线。
@@ -37,9 +39,28 @@ node dist/src/cli.js --repo /path/to/repo --task-file TASK.md --plan-file worker
 
 # 不把生成物 ignore 规则提交到业务仓库，只写本地 .git/info/exclude
 node dist/src/cli.js --repo /path/to/repo --task-file TASK.md --plan-file worker_plan.json --repo-ignore-policy local
+
+# v2：从 seed 启动只读 scouts + deep planner，生成/校验 compiled DAG 并判定规模
+node dist/src/cli.js --repo /path/to/repo --task-file TASK.md \
+  --workflow-seed workflow_seed.json \
+  --workflow-plan-only
+
+# 也可显式传入已有 planner 产物，跳过 planner 调用但保留全部确定性校验
+node dist/src/cli.js --repo /path/to/repo --task-file TASK.md \
+  --workflow-seed workflow_seed.json --compiled-workflow compiled_workflow.json --workflow-plan-only
+
+# v2 manager：只执行自己的 compiled subgraph；plan-only 报告已生成三条完整 manager 命令
+node dist/src/cli.js --repo /manager/worktree --task-file TASK.md \
+  --compiled-workflow /parent/managers/manager-01/compiled_workflow.json \
+  --manager-id manager-01 --parent-run-dir /parent --broker-dir /parent/broker --merge
+
+# 三个 manager 全部成功后，由 Root Codex 执行唯一的最终事务合并
+node dist/src/cli.js --finalize-parent-run /parent/run
 ```
 
-运行报告会包含 `preflight`、`events_file`、`execution_phases`、worker `finding_details`、`resume_commands` 等机器可读字段。`worker_plan.json` 会在运行前做结构校验；`phase.final_tests` 在对应阶段合入 integration 后执行，`final_verification` 只在所有阶段通过后执行。
+v2 报告还包含 `execution_mode`、规模判定、全局 DAG、manager 子图、模型路由、验证票数、broker 并发/调用/成本/等待、pilot、批次、熔断、blocked 节点和恢复命令。少于 12 个 required 写节点永不进入分层模式；只有恰好 3 个无写路径重叠、无跨域实现依赖且各有至少 3 个 implementer 的 workstream 才会生成 3 个 manager。
+
+`workflow_seed.json` 是授权边界：测试和 setup 只能引用 seed 的 `command_catalog`，每条命令使用 `argv` 数组，可选安全的 repo-relative `cwd`。`compiled_workflow.json` 不能引入或修改命令，也不能降低 seed 的风险下限。运行时不执行模型生成的 JavaScript 或裸 shell。
 
 更多说明：
 

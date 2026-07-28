@@ -1,6 +1,6 @@
 {
   "name": "hybrid-worker-ts",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "TypeScript refactor of the Codex hybrid-worker skill harness.",

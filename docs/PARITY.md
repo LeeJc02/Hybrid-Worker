@@ -41,7 +41,14 @@
 - `schemas/` 提供 worker plan、summary、decision、report JSON Schema。
 - `npm run verify` 提供工程级验收脚本：build、test、audit、doctor、pack dry-run；发布包通过 `files` 白名单排除源码测试和 Python 参考副本。
 - `report.json` 输出 worker、merge、timing、usage、环境策略、生成物策略。
-- Vitest 覆盖：33 个测试，包括双 worker merge、缺失 decision、越权路径、生成物清理、accepted branch、tracked artifact、fallback 修复、merge conflict resolver、base repo 污染、npm auto setup、final verification failure、bad summary、failure JSON、dry-run、plan-file、ordered phases、strict preflight、JSON output、local ignore policy、events、结构化 finding。
+- v2 声明式 DAG：seed 命令授权、结构化引用、受限 `when`/`for_each`、环检测、风险下限和模型路由。
+- v2 规模判定：少于 12 个 required 写节点不分层；路径重叠、跨域依赖、workstream 数量/规模不足时自动降级。
+- v2 hierarchical plan-only：3 个唯一 manager branch/worktree/run dir/subplan，共享 parent-run manifest 与 broker 命令。
+- v2 broker：跨进程锁、8 读/4 写默认槽位、64 次调用、10 美元可观测成本预算、等待统计和过期租约回收。
+- v2 独立验证：implementer 不写 decision；medium/high/critical verifier 路由和 critical 2/3 quorum；失败最多一次 deep repair 并完整重跑。
+- v2 pilot/批次/熔断：单 pilot、每批最多 4 个、低于 2/3 或无测试时 blocked。
+- v2 parent finalize：manager 失败时基础分支不变，成功分支保留；恢复后按固定 manager ID 事务合并并最终验证。
+- Vitest 同时覆盖 v1 回归与 v2 fake-agent 分层、repair、broker、budget、circuit、resume/finalize 场景。
 
 验证命令：
 
@@ -54,6 +61,7 @@ npm run build && node dist/src/cli.js --doctor --claude-bin node
 ## 待补齐或需 live 环境验证
 
 - Claude live executor 的真实 CLI 调用样本回归。当前已覆盖 Claude JSON parser 和 fake executor 的完整 harness 链路；live smoke test 仍建议只在显式接受模型成本时运行。
+- seed-only plan-only 已内建只读 scouts 与 deep planner；自动化测试使用 fake planner/scout，live planner/scout smoke test 仍只应在显式接受模型费用时运行。
 - `npm -C` 和 root `npm` 当前有解析测试；端到端测试覆盖 `npm --prefix`，因为它是原 Python 测试中的实际路径。
 - `choosePython()` 的 mock 单元测试可进一步贴近 Python 测试形状；当前 `doctor` 和端到端测试覆盖真实环境路径。
 

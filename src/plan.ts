@@ -2,7 +2,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { validateAllowedPathPrefix } from "./artifacts.js";
 import { parseNamedValue } from "./parse.js";
+import { shellQuote } from "./platform.js";
+import { topologicalLayers } from "./scheduler.js";
+import { modelSelection, verificationPolicy } from "./workflow.js";
 import type { CliOptions, ExecutionPhase, PlanPhase, PreflightResult, WorkerPlan, WorkerSpec } from "./types.js";
+import type { CommandSpec, CompiledWorkflow, WorkflowNode } from "./types.js";
 
 export function loadWorkerPlan(path: string): WorkerPlan {
   const data = JSON.parse(readFileSync(path, "utf8")) as unknown;
@@ -47,7 +51,7 @@ export function preflight(args: CliOptions, repo: string): PreflightResult {
     try {
       const [name, rawPath] = parseNamedValue(item, "--worker");
       const ticket = resolve(isAbsolute(rawPath) ? rawPath : join(repo, rawPath));
-      workers.push({ name, ticket, allowedPaths: allowedByWorker[name] ?? [] });
+      workers.push({ name, ticket, allowedPaths: allowedByWorker[name] ?? [], ...(args.workflowNodes[name] ?? {}) });
     } catch (error) {
       errors.push(error instanceof Error ? error.message : String(error));
     }
@@ -96,6 +100,42 @@ export function buildExecutionPhases(plan: WorkerPlan | null, preflightResult: P
     workers: phase.workers.map((worker) => byName.get(worker.name)).filter((worker): worker is WorkerSpec => worker != null),
     finalTests: [...(phase.final_tests ?? [])]
   }));
+}
+
+export function applyCompiledWorkflowToArgs(args: CliOptions, workflow: CompiledWorkflow): WorkerPlan {
+  if (args.runId == null && workflow.run_id) args.runId = workflow.run_id;
+  const implementationNodes = workflow.nodes.filter((node) => node.kind === "implementer" && node.required);
+  if (implementationNodes.some((node) => node.for_each)) throw new Error("compiled workflow execution requires planner-expanded for_each nodes");
+  const implementationIds = new Set(implementationNodes.map((node) => node.id));
+  const layers = topologicalLayers(
+    implementationNodes.map((node) => ({ ...node, depends_on: node.depends_on.filter((dependency) => implementationIds.has(dependency)) }))
+  );
+  const phases: PlanPhase[] = layers.map((layer, index) => ({
+    name: `dag-${String(index + 1).padStart(2, "0")}`,
+    parallel: true,
+    workers: layer.map((node) => workflowNodeToPlanWorker(node, workflow)),
+    final_tests: []
+  }));
+  for (const node of implementationNodes) {
+    const selection = modelSelection(node);
+    args.workflowNodes[node.id] = {
+      risk: node.risk,
+      route: selection.route,
+      model: selection.model,
+      effort: selection.effort,
+      verification: verificationPolicy(node.risk),
+      ...(selection.fallback ? { fallback: selection.fallback } : {})
+    };
+  }
+  const plan: WorkerPlan = {
+    phases,
+    final_verification: workflow.final_verification.map((ref) => commandText(workflow.command_catalog[ref]!)),
+    split_rationale: ["compiled from declarative v2 DAG"]
+  };
+  if (workflow.run_id) plan.run_id = workflow.run_id;
+  for (const phase of phases) appendPhase(args, phase);
+  args.test.push(...(plan.final_verification ?? []));
+  return plan;
 }
 
 export function validateWorkerPlan(data: unknown): string[] {
@@ -152,6 +192,25 @@ function appendPhase(args: CliOptions, phase: PlanPhase): void {
     for (const path of worker.allowed_paths ?? []) args.allowedPath.push(`${worker.name}:${path}`);
     for (const test of worker.worker_tests ?? []) args.workerTest.push(`${worker.name}:${test}`);
   }
+}
+
+function workflowNodeToPlanWorker(node: WorkflowNode, workflow: CompiledWorkflow): PlanPhase["workers"][number] {
+  if (!node.ticket) throw new Error(`implementer node ${node.id} is missing ticket`);
+  return {
+    name: node.id,
+    ticket: node.ticket,
+    allowed_paths: node.paths,
+    worker_tests: node.command_refs.map((ref) => {
+      const command = workflow.command_catalog[ref];
+      if (!command) throw new Error(`node ${node.id} references unknown command ${ref}`);
+      return commandText(command);
+    })
+  };
+}
+
+export function commandText(command: CommandSpec): string {
+  const invocation = command.argv.map(shellQuote).join(" ");
+  return command.cwd ? `cd ${shellQuote(command.cwd)} && ${invocation}` : invocation;
 }
 
 function warnWorkerRisk(workers: WorkerSpec[], workerTests: Record<string, string[]>, warnings: string[]): void {
