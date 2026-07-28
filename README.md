@@ -1,104 +1,82 @@
 # Hybrid Worker
 
-Hybrid Worker 是一个面向 Codex 与 Claude Code 的 TypeScript 多智能体执行框架。Codex 负责规划、分层编排与最终集成，Claude workers 在隔离的 Git worktree 中实现任务；harness 统一执行路径、测试、验证、资源预算和事务合并门禁。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-[![CI](https://img.shields.io/badge/tests-48%20passing-1f883d)](https://github.com/LeeJc02/Hybrid-Worker)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## 核心能力
+Hybrid Worker is a cost-aware multi-agent execution harness for Codex and Claude Code. It keeps Codex focused on planning, task decomposition, orchestration, and final integration, while Claude workers handle implementation, focused testing, self-review, and repair.
 
-- 保留 v1 `worker_plan.json`、隔离 worktree、确定性门禁和事务合并流程。
-- v2 使用声明式 JSON DAG，支持依赖、结构化引用、受限 `when`、`for_each` 和逐项验证。
-- 根据确定性规模规则选择单层执行或三个 manager 的分层执行。
-- 所有 manager 共享跨进程资源 broker，统一限制并发、调用次数和可观测成本。
-- implementer 不自签审核结果，由 harness 发起独立 verifier 投票。
-- 同质任务采用 pilot 和分批执行，低通过率或无测试时自动熔断。
-- 任一 manager 失败时保持基础分支不变，并保留成功分支用于恢复。
+The project began as a way to route implementation work through more cost-efficient models available via Claude Code. For workloads that split cleanly, this design can reduce Codex token usage by approximately **40%-90% while preserving comparable delivery quality**. Actual savings depend on task shape and model routing; deterministic gates, independent verification, and transactional merges protect the quality bar.
 
-## 工作方式
+## How It Works
+
+Hybrid Worker uses one workflow with adaptive orchestration. Small and medium tasks stay in a single layer. Large tasks that can be divided into three independent domains use a second layer of Codex managers, allowing Claude worker calls to scale beyond Codex's four concurrent agent slots without allowing uncontrolled writes to the same repository.
 
 ```mermaid
 flowchart TD
-    R[Root Codex] --> P[Prework + Planner]
-    P --> D{Execution mode}
-    D -->|single_layer| S[Hybrid Worker DAG]
-    D -->|hierarchical| A[Manager A]
-    D -->|hierarchical| B[Manager B]
-    D -->|hierarchical| C[Manager C]
-    A --> WA[Claude workers]
-    B --> WB[Claude workers]
-    C --> WC[Claude workers]
-    WA --> G[Shared resource broker]
+    R[Root Codex] --> P[Read-only prework and planning]
+    P --> D{Task can be split safely?}
+    D -->|Single layer| H[Hybrid Worker DAG]
+    D -->|Three independent domains| A[Codex Manager A]
+    D -->|Three independent domains| B[Codex Manager B]
+    D -->|Three independent domains| C[Codex Manager C]
+    A --> HA[Hybrid Worker A]
+    B --> HB[Hybrid Worker B]
+    C --> HC[Hybrid Worker C]
+    H --> W[Claude workers]
+    HA --> WA[Claude workers]
+    HB --> WB[Claude workers]
+    HC --> WC[Claude workers]
+    W --> G[Shared resource broker]
+    WA --> G
     WB --> G
     WC --> G
-    A --> M[Root transactional merge]
-    B --> M
-    C --> M
+    G --> V[Tests, verification, and transactional merge]
+    V --> R
 ```
 
-分层模式只会在以下条件全部满足时启用：
+The two-layer path is enabled only when deterministic checks find at least 12 required write nodes, exactly three low-overlap workstreams, at least three implementation nodes per workstream, no cross-domain write overlap or implementation dependency, a unique owner for shared files, and complete final verification commands. Otherwise, execution remains in a single dynamic DAG.
 
-- 至少 12 个 required 写入节点。
-- 恰好三个低重叠 workstream。
-- 每个 workstream 至少三个 implementer。
-- 不存在跨域写路径重叠或跨域实现依赖。
-- 共享契约已经冻结并具有唯一 owner。
-- 最终验证命令完整。
+## Core Mechanisms
 
-不满足条件时自动降级为 `single_layer` 或 `single_layer_dynamic_dag`。
+- **Plan before execution:** Codex defines the objective, path ownership, dependencies, risk floor, and an allowlisted command catalog. Read-only scouts fill evidence gaps before the workflow is compiled.
+- **Route by difficulty:** fast classification and scouting use Haiku, normal implementation and verification use Sonnet, and high-risk work, repair, and critical verification use Opus. Risk floors cannot be downgraded by the planner.
+- **Isolate every writer:** each implementation node runs on its own Git branch and worktree. Managers also receive unique branches, worktrees, and run directories.
+- **Verify independently:** the harness checks paths, diffs, generated artifacts, and tests. Medium- and high-risk work adds independent verification; critical work requires a two-of-three deep-verifier quorum.
+- **Bound cost and concurrency:** all managers share one lease-based broker instead of receiving separate quotas. Pilot batches validate homogeneous work before broader execution, and low pass rates trigger a circuit breaker.
+- **Merge transactionally:** worker changes merge into integration branches first. The original branch is fast-forwarded only after every required node and final verification pass. Successful branches and checkpoints remain reusable after a failure.
 
-## 环境要求
+Implementers do not approve their own work. A failed verification may trigger at most one deep repair, followed by a complete test and verification rerun.
 
-- Node.js 22 或更高版本。
-- Git 2.x。
-- Claude Code CLI，用于真实 worker、scout、planner 和 verifier 调用。
-- 可选 Python 环境，用于目标仓库的测试与 JSON 验证。
+## Default Limits
 
-## 安装
+| Resource | Default |
+| --- | ---: |
+| Read-only Claude agents | 8 |
+| Writing Claude workers | 4 |
+| Claude agent calls | 64 |
+| Observable cost ceiling | USD 10 |
+| Nodes per batch | 4 |
+| Circuit-breaker pass rate | 2/3 |
 
-```bash
-git clone git@github.com:LeeJc02/Hybrid-Worker.git
-cd Hybrid-Worker
-npm ci
-npm run build
-npm run doctor
-```
+The broker applies these limits globally across every manager process and reclaims expired leases after abnormal exits.
 
-作为 Codex skill 使用时，可以直接克隆到 Codex skills 目录：
+## Quick Start
+
+Requirements: Node.js 22+, Git 2.x, and the Claude Code CLI.
+
+Install as a Codex skill:
 
 ```bash
 git clone git@github.com:LeeJc02/Hybrid-Worker.git ~/.codex/skills/hybrid-worker
 cd ~/.codex/skills/hybrid-worker
 npm ci
 npm run build
+npm run doctor
 ```
 
-## v1 快速开始
-
-准备 `TASK.md`、worker ticket 和 `worker_plan.json`：
-
-```bash
-node dist/src/cli.js \
-  --repo /path/to/target-repo \
-  --task-file TASK.md \
-  --plan-file worker_plan.json \
-  --dry-run
-```
-
-预检通过后执行并合并：
-
-```bash
-node dist/src/cli.js \
-  --repo /path/to/target-repo \
-  --task-file TASK.md \
-  --plan-file worker_plan.json \
-  --merge
-```
-
-## v2 快速开始
-
-`workflow_seed.json` 定义目标、风险下限和唯一允许执行的命令目录：
+Define the objective, risk floor, and allowed verification commands in `workflow_seed.json`:
 
 ```json
 {
@@ -111,63 +89,26 @@ node dist/src/cli.js \
 }
 ```
 
-从 seed 启动只读 prework、scouts 和 planner：
+Compile and validate the workflow before starting any writing worker:
 
 ```bash
-node dist/src/cli.js \
+node ~/.codex/skills/hybrid-worker/dist/src/cli.js \
   --repo /path/to/target-repo \
   --task-file TASK.md \
   --workflow-seed workflow_seed.json \
   --workflow-plan-only
 ```
 
-报告中的 `execution_mode` 决定下一步：
-
-- `single_layer`：由 Root Codex 启动一个 hybrid-worker。
-- `single_layer_dynamic_dag`：由 Root Codex 启动一个动态 DAG。
-- `hierarchical`：Root Codex 才能启动报告中生成的三个 manager 命令。
-
-三个 manager 全部成功后执行最终事务合并：
+The report selects the execution shape and provides the commands to run. Root Codex launches one hybrid-worker process for a single-layer graph, or exactly three generated manager commands for a hierarchical graph. After all managers succeed, finalize the parent transaction:
 
 ```bash
-node dist/src/cli.js --finalize-parent-run /path/to/parent-run
+node ~/.codex/skills/hybrid-worker/dist/src/cli.js \
+  --finalize-parent-run /path/to/parent-run
 ```
 
-## 默认资源与验证策略
+The compiled workflow may reference only commands authorized by the seed. Model-generated JavaScript and unapproved bare shell commands are rejected.
 
-| 项目 | 默认值 |
-| --- | ---: |
-| 只读 Claude agents | 8 |
-| 写入 Claude workers | 4 |
-| Claude agent 调用上限 | 64 |
-| 可观测成本上限 | 10 USD |
-| 单批节点数 | 4 |
-| 熔断通过率 | 2/3 |
-
-模型路由：
-
-- `fast` 使用 Haiku，负责分类和 scouts。
-- `balanced` 使用 Sonnet，负责普通实现和验证。
-- `deep` 使用 Opus，负责高风险节点、repair 和关键验证。
-
-验证级别：
-
-- `low`：确定性路径、diff、生成物和测试门禁。
-- `medium`：增加一个 balanced verifier。
-- `high`：增加一个 deep verifier。
-- `critical`：三个 deep verifier，至少两票通过。
-- 验证失败最多运行一次 deep repair，然后完整重跑测试和验证。
-
-## 安全边界
-
-- 每个写入节点使用独立 branch 和 worktree。
-- 基础仓库在最终验证通过前不会被 fast-forward。
-- planner 只能引用 seed `command_catalog` 中的命令，不能生成新的裸 shell 或 JavaScript。
-- allowed paths、forbidden paths、diff 大小、生成物、测试和 base repo 污染均由 harness 门禁检查。
-- 资源 broker 使用跨进程锁、租约续期、原子状态写入和过期租约回收。
-- credentials、模型日志、运行产物、缓存和 `node_modules` 不应提交到仓库。
-
-## 开发
+## Development
 
 ```bash
 npm ci
@@ -178,26 +119,26 @@ npm run check
 npm run verify
 ```
 
-测试使用 Vitest 和 fake agents，不会在自动化测试中产生真实 Claude 调用费用。
-
-项目结构：
+Tests use Vitest and fake agents, so automated verification does not incur live Claude model costs.
 
 ```text
-src/       CLI、DAG、broker、worker、Git 与报告实现
-tests/     单元测试和 fake-agent 集成测试
-schemas/   seed、compiled workflow、worker 与 report JSON Schema
-docs/      架构和兼容性说明
-agents/    Codex skill UI 元数据
-SKILL.md   Codex hybrid-worker 行为契约
+src/       CLI, workflow, broker, worker, Git, and reporting code
+tests/     Unit and fake-agent integration tests
+schemas/   Workflow, worker, and report JSON Schemas
+docs/      Architecture and compatibility notes
+agents/    Codex skill metadata
+SKILL.md   Codex integration contract
 ```
 
-详细设计参见 [架构说明](docs/ARCHITECTURE.md)，兼容与测试矩阵参见 [PARITY](docs/PARITY.md)。
+See [Architecture](docs/ARCHITECTURE.md) for the detailed design and [Parity](docs/PARITY.md) for compatibility and test coverage.
 
-## 版本历史
+## Version History
 
-- v1：单层 worker plan、隔离 worktree、确定性门禁与事务合并。
-- v2：动态 DAG、分层 managers、全局 broker、独立 verifier、熔断和断点恢复。
+- **v1:** introduced single-layer worker plans, isolated worktrees, deterministic gates, and transactional merging.
+- **v2:** added declarative dynamic DAGs, hierarchical managers, a global resource broker, independent verification, circuit breaking, and resumable execution.
+
+These labels describe project history only. The current project exposes one adaptive Hybrid Worker workflow.
 
 ## License
 
-本项目基于 [MIT License](LICENSE) 发布。
+Released under the [MIT License](LICENSE).
