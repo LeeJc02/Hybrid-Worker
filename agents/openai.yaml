@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hybrid Worker"
+  short_description: "Explicit hybrid mode with parallel Claude workers and deterministic merge gates"
+  default_prompt: "Use $hybrid-worker for hybrid mode: Codex plans worker tickets, Claude workers implement in parallel, and the harness merges only after deterministic gates and tests pass."

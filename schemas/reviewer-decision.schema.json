@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex.local/hybrid-worker-ts/reviewer-decision.schema.json",
+  "title": "Hybrid Worker Reviewer Decision",
+  "type": "object",
+  "required": [
+    "worker",
+    "decision",
+    "issues_found",
+    "fixes_applied",
+    "tests_run",
+    "tests_passed",
+    "merge_risk"
+  ],
+  "properties": {
+    "worker": { "type": "string", "minLength": 1 },
+    "decision": { "const": "PASS" },
+    "issues_found": { "type": "array" },
+    "fixes_applied": { "type": "array" },
+    "tests_run": { "type": "array", "items": { "type": "string" } },
+    "tests_passed": { "type": "boolean" },
+    "merge_risk": { "type": "string", "enum": ["low", "medium", "high"] }
+  },
+  "additionalProperties": true
+}

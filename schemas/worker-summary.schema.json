@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex.local/hybrid-worker-ts/worker-summary.schema.json",
+  "title": "Hybrid Worker Summary",
+  "type": "object",
+  "required": [
+    "worker",
+    "summary",
+    "changed_files",
+    "tests_run",
+    "tests_passed",
+    "risks",
+    "needs_codex_attention"
+  ],
+  "properties": {
+    "worker": { "type": "string", "minLength": 1 },
+    "summary": { "type": "string" },
+    "changed_files": { "type": "array", "items": { "type": "string" } },
+    "docs_written": { "type": "array", "items": { "type": "string" } },
+    "tests_run": { "type": "array", "items": { "type": "string" } },
+    "tests_passed": { "type": "boolean" },
+    "risks": { "type": "array" },
+    "needs_codex_attention": { "type": "boolean" },
+    "token_usage_note": { "type": "string" }
+  },
+  "additionalProperties": true
+}

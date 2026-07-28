@@ -1,0 +1,35 @@
+{
+  "name": "hybrid-worker-ts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript refactor of the Codex hybrid-worker skill harness.",
+  "files": [
+    "dist/src/",
+    "schemas/",
+    "docs/",
+    "README.md"
+  ],
+  "bin": {
+    "hybrid-worker-ts": "./dist/src/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "doctor": "npm run build >/dev/null && node dist/src/cli.js --doctor --claude-bin node",
+    "dev": "tsx src/cli.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run build && npm test",
+    "pack:dry": "npm pack --dry-run",
+    "verify": "npm run check && npm audit --audit-level=moderate && npm run doctor && npm run pack:dry"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.9"
+  }
+}

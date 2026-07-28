@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex.local/hybrid-worker-ts/report.schema.json",
+  "title": "Hybrid Worker Report",
+  "type": "object",
+  "required": ["status", "repo", "run_id", "workers", "merge", "timing", "usage"],
+  "properties": {
+    "status": { "type": "string" },
+    "repo": { "type": "string" },
+    "base_branch": { "type": "string" },
+    "run_id": { "type": "string" },
+    "model": { "type": "string" },
+    "model_overridden": { "type": "boolean" },
+    "events_file": { "type": "string" },
+    "preflight": {
+      "type": "object",
+      "properties": {
+        "ok": { "type": "boolean" },
+        "errors": { "type": "array", "items": { "type": "string" } },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": true
+    },
+    "workers_requested": { "type": "array" },
+    "execution_phases": { "type": "array" },
+    "workers": { "type": "array" },
+    "merge": { "type": "object" },
+    "timing": { "type": "object" },
+    "usage": { "type": "object" },
+    "resume_commands": { "type": "object" },
+    "environment_policy": { "type": "object" }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex.local/hybrid-worker-ts/worker-plan.schema.json",
+  "title": "Hybrid Worker Plan",
+  "type": "object",
+  "required": ["phases"],
+  "properties": {
+    "run_id": { "type": "string" },
+    "model": { "type": "string" },
+    "shared_setup": { "type": "array", "items": { "type": "string" } },
+    "phases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "workers"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "parallel": { "type": "boolean" },
+          "workers": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["name", "ticket"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "ticket": { "type": "string", "minLength": 1 },
+                "allowed_paths": { "type": "array", "items": { "type": "string" } },
+                "worker_tests": { "type": "array", "items": { "type": "string" } }
+              },
+              "additionalProperties": true
+            }
+          },
+          "final_tests": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": true
+      }
+    },
+    "final_verification": { "type": "array", "items": { "type": "string" } },
+    "split_rationale": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": true
+}
